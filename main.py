@@ -16,7 +16,6 @@ def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# Запускаем веб-сервер в отдельном потоке
 threading.Thread(target=run_web).start()
 
 
@@ -27,7 +26,7 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ID вашего канала-ловушки
+# ID канала-ловушки
 TARGET_CHANNEL_ID = 1536698437758623824 
 
 @bot.event
@@ -40,28 +39,28 @@ async def on_ready():
         if not has_warning_pin:
             warning_msg = await channel.send(
                 "⚠️ **ВНИМАНИЕ!** Этот канал заблокирован.\n"
-                "Любое отправленное сюда сообщение приведет к **муту на 12 часов** и удалению сообщений!"
+                "Любое отправленное сюда сообщение приведет к **муту на 12 часов** и удалению сообщений во всех каналах!"
             )
             await warning_msg.pin()
 
 @bot.event
 async def on_message(message):
-    # Игнорируем личные сообщения, ботов и другие каналы
+    # Игнорируем бота и сообщения вне канала-ловушки
     if message.author.bot or message.channel.id != TARGET_CHANNEL_ID:
         return
 
-    # Игнорируем администраторов сервера
+    # Игнорируем администраторов
     if message.author.guild_permissions.administrator:
         return
 
     user = message.author
-    channel = message.channel
+    guild = message.guild
 
-    # 1. Мгновенно удаляем только что отправленное сообщение
+    # 1. Мгновенно удаляем сообщение из канала-ловушки
     try:
         await message.delete()
     except Exception as e:
-        print(f"Не удалось удалить текущее сообщение: {e}")
+        print(f"Не удалось удалить сообщение: {e}")
 
     # 2. Выдаем пользователю таймаут на 12 часов
     try:
@@ -69,17 +68,20 @@ async def on_message(message):
     except Exception as e:
         print(f"Ошибка при выдаче таймаута: {e}")
 
-    # 3. Ищем и удаляем любые сообщения этого пользователя за последние 5 минут
+    # 3. Проходим по ВСЕМ текстовым каналам сервера и чистим сообщения нарушителя за последние 5 минут
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
         return m.author.id == user.id and m.created_at >= five_minutes_ago
 
-    try:
-        await channel.purge(limit=200, check=is_user_recent_message)
-    except Exception as e:
-        print(f"Ошибка при очистке истории: {e}")
+    for text_channel in guild.text_channels:
+        try:
+            # Проверяем права бота в конкретном канале перед очисткой
+            permissions = text_channel.permissions_for(guild.me)
+            if permissions.manage_messages and permissions.read_message_history:
+                await text_channel.purge(limit=100, check=is_user_recent_message)
+        except Exception as e:
+            print(f"Не удалось очистить канал {text_channel.name}: {e}")
 
-# Запуск бота с токеном из переменной окружения
 TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(TOKEN)
