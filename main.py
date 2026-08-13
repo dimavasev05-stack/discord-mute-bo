@@ -1,6 +1,7 @@
 import os
 import threading
 import requests
+import asyncio
 import discord
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
@@ -39,36 +40,38 @@ def send_telegram_notification(username, user_id, content, attachments):
         print("Telegram token или Chat ID не настроены.")
         return
 
-    # Заголовок и основной текст
     caption_text = (
         f"🚨 **Нарушение в канале-ловушке!**\n\n"
         f"👤 **Пользователь:** {username} (ID: `{user_id}`)\n"
         f"💬 **Текст:** {content if content else '_[без текста]_'}"
     )
 
-    # Если есть прикреплённые файлы/изображения
+    # Инлайн-кнопка для Telegram
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": "🔓 Снять мут (Unmute)", "callback_data": f"unmute_{user_id}"}]
+        ]
+    }
+
     if attachments:
-        # Разделяем изображения и обычные файлы
         images = [att for att in attachments if att.content_type and att.content_type.startswith('image/')]
         other_files = [att for att in attachments if att not in images]
 
-        # 1. Если есть картинки
         if images:
             if len(images) == 1:
-                # Одно изображение отправляем через sendPhoto
                 url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
                     "photo": images[0].url,
                     "caption": caption_text,
-                    "parse_mode": "Markdown"
+                    "parse_mode": "Markdown",
+                    "reply_markup": reply_markup
                 }
                 try:
                     requests.post(url, json=payload, timeout=10)
                 except Exception as e:
                     print(f"Ошибка отправки фото в Telegram: {e}")
             else:
-                # Если несколько картинок — отправляем как альбом (Media Group)
                 url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMediaGroup"
                 media = []
                 for i, img in enumerate(images):
@@ -78,16 +81,19 @@ def send_telegram_notification(username, user_id, content, attachments):
                         item["parse_mode"] = "Markdown"
                     media.append(item)
                 
-                payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "media": media
-                }
                 try:
-                    requests.post(url, json=payload, timeout=10)
+                    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "media": media}, timeout=10)
+                    # Кнопку отправляем отдельным сообщением после альбома
+                    url_msg = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                    requests.post(url_msg, json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": f"Управление мутом для `{username}`:",
+                        "parse_mode": "Markdown",
+                        "reply_markup": reply_markup
+                    }, timeout=5)
                 except Exception as e:
                     print(f"Ошибка отправки альбома в Telegram: {e}")
 
-        # 2. Если есть прочие файлы (документы, видео, гифки и т.д.)
         for file in other_files:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
             file_caption = caption_text if not images else f"📎 Файл от {username}"
@@ -95,7 +101,8 @@ def send_telegram_notification(username, user_id, content, attachments):
                 "chat_id": TELEGRAM_CHAT_ID,
                 "document": file.url,
                 "caption": file_caption,
-                "parse_mode": "Markdown"
+                "parse_mode": "Markdown",
+                "reply_markup": reply_markup
             }
             try:
                 requests.post(url, json=payload, timeout=10)
@@ -103,17 +110,83 @@ def send_telegram_notification(username, user_id, content, attachments):
                 print(f"Ошибка отправки документа в Telegram: {e}")
 
     else:
-        # Если вложений нет — отправляем простое текстовое сообщение
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": caption_text,
-            "parse_mode": "Markdown"
+            "parse_mode": "Markdown",
+            "reply_markup": reply_markup
         }
         try:
             requests.post(url, json=payload, timeout=5)
         except Exception as e:
             print(f"Ошибка отправки сообщения в Telegram: {e}")
+
+
+# === СЛУШАТЕЛЬ НАЖАТИЙ КНОПОК В TELEGRAM ===
+def telegram_polling():
+    if not TELEGRAM_TOKEN:
+        return
+    
+    offset = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset}&timeout=10"
+            res = requests.get(url, timeout=15).json()
+            
+            if res.get("ok"):
+                for update in res.get("result", []):
+                    offset = update["update_id"] + 1
+                    
+                    if "callback_query" in update:
+                        cq = update["callback_query"]
+                        data = cq.get("data", "")
+                        callback_id = cq.get("id")
+                        
+                        if data.startswith("unmute_"):
+                            user_id = int(data.split("_")[1])
+                            
+                            # Передаем задачу на размут в основной поток Discord
+                            future = asyncio.run_coroutine_threadsafe(unmute_discord_user(user_id), bot.loop)
+                            success, user_name = future.result(timeout=10)
+                            
+                            # Ответ всплывающим уведомлением в Telegram
+                            answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+                            if success:
+                                msg_text = f"✅ Таймаут с пользователя {user_name} успешно снят!"
+                            else:
+                                msg_text = f"❌ Не удалось снять таймаут (пользователь не найден или снят вручную)."
+                            
+                            requests.post(answer_url, json={"callback_query_id": callback_id, "text": msg_text, "show_alert": True})
+                            
+                            # Обновляем сообщение в Telegram, убирая кнопку
+                            if success and "message" in cq:
+                                chat_id = cq["message"]["chat"]["id"]
+                                msg_id = cq["message"]["message_id"]
+                                edit_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup"
+                                requests.post(edit_url, json={"chat_id": chat_id, "message_id": msg_id, "reply_markup": {"inline_keyboard": []}})
+        except Exception as e:
+            pass
+        asyncio.run(asyncio.sleep(2))
+
+threading.Thread(target=telegram_polling, daemon=True).start()
+
+
+async def unmute_discord_user(user_id):
+    try:
+        channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not channel:
+            return False, ""
+        
+        guild = channel.guild
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+        
+        if member:
+            await member.timeout(None, reason="Мут снят вручную через Telegram")
+            return True, str(member)
+    except Exception as e:
+        print(f"Ошибка снятия мута: {e}")
+    return False, ""
 
 
 @bot.event
@@ -141,7 +214,7 @@ async def on_message(message):
     user = message.author
     guild = message.guild
 
-    # 1. Отправляем фото/текст/файлы в Telegram перед удалением из Discord
+    # 1. Отправляем уведомление в Telegram перед удалением из Discord
     send_telegram_notification(
         username=str(user),
         user_id=user.id,
