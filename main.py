@@ -1,5 +1,6 @@
 import os
 import threading
+import requests
 import discord
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,40 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ID канала-ловушки
 TARGET_CHANNEL_ID = 1536698437758623824 
 
+# Данные Telegram из переменных окружения
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+def send_telegram_notification(username, user_id, content, attachments):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram token или Chat ID не настроены.")
+        return
+
+    # Формируем текст уведомления
+    text = (
+        f"🚨 **Нарушение в канале-ловушке!**\n\n"
+        f"👤 **Пользователь:** {username} (ID: `{user_id}`)\n"
+        f"💬 **Текст:** {content if content else '_[без текста]_'}\n"
+    )
+
+    if attachments:
+        text += "\n📎 **Вложения/Медиа:**\n"
+        for url in attachments:
+            text += f"• {url}\n"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Ошибка отправки в Telegram: {e}")
+
+
 @bot.event
 async def on_ready():
     print(f"Бот {bot.user} успешно запущен!")
@@ -39,36 +74,45 @@ async def on_ready():
         if not has_warning_pin:
             warning_msg = await channel.send(
                 "⚠️ **ВНИМАНИЕ!** Этот канал заблокирован.\n"
-                "Любое отправленное сюда сообщение приведет к **муту на 12 часов** и удалению сообщений во всех каналах!"
+                "Любое отправленное сюда сообщение приведет к **муту на 12 часов** и удалению сообщений!"
             )
             await warning_msg.pin()
 
 @bot.event
 async def on_message(message):
-    # Игнорируем бота и сообщения вне канала-ловушки
     if message.author.bot or message.channel.id != TARGET_CHANNEL_ID:
         return
 
-    # Игнорируем администраторов
     if message.author.guild_permissions.administrator:
         return
 
     user = message.author
     guild = message.guild
 
-    # 1. Мгновенно удаляем сообщение из канала-ловушки
+    # Собираем ссылки на медиафайлы/вложения
+    attachment_urls = [att.url for att in message.attachments]
+
+    # 1. Отправляем уведомление в Telegram перед удалением
+    send_telegram_notification(
+        username=str(user),
+        user_id=user.id,
+        content=message.content,
+        attachments=attachment_urls
+    )
+
+    # 2. Мгновенно удаляем сообщение из канала-ловушки
     try:
         await message.delete()
     except Exception as e:
         print(f"Не удалось удалить сообщение: {e}")
 
-    # 2. Выдаем пользователю таймаут на 12 часов
+    # 3. Выдаем таймаут на 12 часов
     try:
         await user.timeout(timedelta(hours=12), reason="Сообщение в заблокированном канале")
     except Exception as e:
         print(f"Ошибка при выдаче таймаута: {e}")
 
-    # 3. Проходим по ВСЕМ текстовым каналам сервера и чистим сообщения нарушителя за последние 5 минут
+    # 4. Чистим сообщения нарушителя за последние 5 минут во всех каналах
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
@@ -76,7 +120,6 @@ async def on_message(message):
 
     for text_channel in guild.text_channels:
         try:
-            # Проверяем права бота в конкретном канале перед очисткой
             permissions = text_channel.permissions_for(guild.me)
             if permissions.manage_messages and permissions.read_message_history:
                 await text_channel.purge(limit=100, check=is_user_recent_message)
