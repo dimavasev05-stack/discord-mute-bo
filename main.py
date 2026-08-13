@@ -39,29 +39,81 @@ def send_telegram_notification(username, user_id, content, attachments):
         print("Telegram token или Chat ID не настроены.")
         return
 
-    # Формируем текст уведомления
-    text = (
+    # Заголовок и основной текст
+    caption_text = (
         f"🚨 **Нарушение в канале-ловушке!**\n\n"
         f"👤 **Пользователь:** {username} (ID: `{user_id}`)\n"
-        f"💬 **Текст:** {content if content else '_[без текста]_'}\n"
+        f"💬 **Текст:** {content if content else '_[без текста]_'}"
     )
 
+    # Если есть прикреплённые файлы/изображения
     if attachments:
-        text += "\n📎 **Вложения/Медиа:**\n"
-        for url in attachments:
-            text += f"• {url}\n"
+        # Разделяем изображения и обычные файлы
+        images = [att for att in attachments if att.content_type and att.content_type.startswith('image/')]
+        other_files = [att for att in attachments if att not in images]
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+        # 1. Если есть картинки
+        if images:
+            if len(images) == 1:
+                # Одно изображение отправляем через sendPhoto
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "photo": images[0].url,
+                    "caption": caption_text,
+                    "parse_mode": "Markdown"
+                }
+                try:
+                    requests.post(url, json=payload, timeout=10)
+                except Exception as e:
+                    print(f"Ошибка отправки фото в Telegram: {e}")
+            else:
+                # Если несколько картинок — отправляем как альбом (Media Group)
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMediaGroup"
+                media = []
+                for i, img in enumerate(images):
+                    item = {"type": "photo", "media": img.url}
+                    if i == 0:
+                        item["caption"] = caption_text
+                        item["parse_mode"] = "Markdown"
+                    media.append(item)
+                
+                payload = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "media": media
+                }
+                try:
+                    requests.post(url, json=payload, timeout=10)
+                except Exception as e:
+                    print(f"Ошибка отправки альбома в Telegram: {e}")
 
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Ошибка отправки в Telegram: {e}")
+        # 2. Если есть прочие файлы (документы, видео, гифки и т.д.)
+        for file in other_files:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+            file_caption = caption_text if not images else f"📎 Файл от {username}"
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "document": file.url,
+                "caption": file_caption,
+                "parse_mode": "Markdown"
+            }
+            try:
+                requests.post(url, json=payload, timeout=10)
+            except Exception as e:
+                print(f"Ошибка отправки документа в Telegram: {e}")
+
+    else:
+        # Если вложений нет — отправляем простое текстовое сообщение
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": caption_text,
+            "parse_mode": "Markdown"
+        }
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            print(f"Ошибка отправки сообщения в Telegram: {e}")
 
 
 @bot.event
@@ -89,15 +141,12 @@ async def on_message(message):
     user = message.author
     guild = message.guild
 
-    # Собираем ссылки на медиафайлы/вложения
-    attachment_urls = [att.url for att in message.attachments]
-
-    # 1. Отправляем уведомление в Telegram перед удалением
+    # 1. Отправляем фото/текст/файлы в Telegram перед удалением из Discord
     send_telegram_notification(
         username=str(user),
         user_id=user.id,
         content=message.content,
-        attachments=attachment_urls
+        attachments=message.attachments
     )
 
     # 2. Мгновенно удаляем сообщение из канала-ловушки
