@@ -2,6 +2,7 @@ import os
 import threading
 import requests
 import asyncio
+import time
 import discord
 from discord.ext import commands
 from datetime import datetime, timedelta, timezone
@@ -157,13 +158,16 @@ def telegram_polling():
                             user_id = int(data.split("_")[1])
                             
                             future = asyncio.run_coroutine_threadsafe(unmute_discord_user(user_id), bot.loop)
-                            success, user_name = future.result(timeout=10)
+                            try:
+                                success, user_name = future.result(timeout=10)
+                            except Exception as e:
+                                success, user_name = False, ""
                             
                             answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
                             if success:
                                 msg_text = f"✅ Таймаут с пользователя {user_name} успешно снят!"
                             else:
-                                msg_text = f"❌ Не удалось снять таймаут (пользователь не найден или снят вручную)."
+                                msg_text = f"❌ Не удалось снять таймаут."
                             
                             requests.post(answer_url, json={"callback_query_id": callback_id, "text": msg_text, "show_alert": True})
                             
@@ -174,7 +178,7 @@ def telegram_polling():
                                 requests.post(edit_url, json={"chat_id": chat_id, "message_id": msg_id, "reply_markup": {"inline_keyboard": []}})
         except Exception as e:
             pass
-        asyncio.run(asyncio.sleep(2))
+        time.sleep(2)
 
 threading.Thread(target=telegram_polling, daemon=True).start()
 
@@ -247,7 +251,7 @@ async def on_message(message):
     except Exception as e:
         print(f"[ОШИБКА ТАЙМАУТА] {e}")
 
-    # 4. Чистим сообщения пользователя за последние 5 минут ТОЛЬКО в этом канале (чтобы избежать Rate Limit)
+    # 4. Чистим сообщения пользователя за последние 5 минут в ловушке
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
