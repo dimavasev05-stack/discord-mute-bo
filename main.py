@@ -19,7 +19,7 @@ def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-threading.Thread(target=run_web).start()
+threading.Thread(target=run_web, daemon=True).start()
 
 
 # === НАСТРОЙКА И КОД ДИСКОРД БОТА ===
@@ -31,6 +31,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ID канала-ловушки
 TARGET_CHANNEL_ID = 1536698437758623824 
+# Название закрытого канала-лога в Discord
+LOG_CHANNEL_NAME = "лог-ловушка"
 
 # Данные Telegram из переменных окружения
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -53,62 +55,7 @@ def send_telegram_notification(username, user_id, content, attachments):
         ]
     }
 
-    if attachments:
-        images = [att for att in attachments if att.content_type and att.content_type.startswith('image/')]
-        other_files = [att for att in attachments if att not in images]
-
-        if images:
-            if len(images) == 1:
-                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-                payload = {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "photo": images[0].url,
-                    "caption": caption_text,
-                    "parse_mode": "Markdown",
-                    "reply_markup": reply_markup
-                }
-                try:
-                    requests.post(url, json=payload, timeout=10)
-                except Exception as e:
-                    print(f"Ошибка отправки фото в Telegram: {e}")
-            else:
-                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMediaGroup"
-                media = []
-                for i, img in enumerate(images):
-                    item = {"type": "photo", "media": img.url}
-                    if i == 0:
-                        item["caption"] = caption_text
-                        item["parse_mode"] = "Markdown"
-                    media.append(item)
-                
-                try:
-                    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "media": media}, timeout=10)
-                    url_msg = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                    requests.post(url_msg, json={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": f"Управление мутом для `{username}`:",
-                        "parse_mode": "Markdown",
-                        "reply_markup": reply_markup
-                    }, timeout=5)
-                except Exception as e:
-                    print(f"Ошибка отправки альбома в Telegram: {e}")
-
-        for file in other_files:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-            file_caption = caption_text if not images else f"📎 Файл от {username}"
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "document": file.url,
-                "caption": file_caption,
-                "parse_mode": "Markdown",
-                "reply_markup": reply_markup
-            }
-            try:
-                requests.post(url, json=payload, timeout=10)
-            except Exception as e:
-                print(f"Ошибка отправки документа в Telegram: {e}")
-
-    else:
+    try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -116,10 +63,13 @@ def send_telegram_notification(username, user_id, content, attachments):
             "parse_mode": "Markdown",
             "reply_markup": reply_markup
         }
-        try:
-            requests.post(url, json=payload, timeout=5)
-        except Exception as e:
-            print(f"Ошибка отправки сообщения в Telegram: {e}")
+        res = requests.post(url, json=payload, timeout=5)
+        if not res.ok:
+            print(f"[ОШИБКА TELEGRAM API] {res.status_code}: {res.text}")
+        else:
+            print("Уведомление в Telegram успешно отправлено!")
+    except Exception as e:
+        print(f"[ОШИБКА ОТПРАВКИ В TELEGRAM] {e}")
 
 
 # === СЛУШАТЕЛЬ НАЖАТИЙ КНОПОК В TELEGRAM ===
@@ -141,7 +91,6 @@ def telegram_polling():
                         cq = update["callback_query"]
                         from_user_id = str(cq.get("from", {}).get("id"))
                         
-                        # Защита: проверяем, что нажал именно хозяин бота
                         if TELEGRAM_CHAT_ID and from_user_id != str(TELEGRAM_CHAT_ID):
                             answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
                             requests.post(answer_url, json={
@@ -200,6 +149,40 @@ async def unmute_discord_user(user_id):
     return False, ""
 
 
+async def get_or_create_log_channel(guild):
+    """Находит или создаёт приватный канал логов только для бота и роли owner/владельца"""
+    log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    if log_channel:
+        return log_channel
+
+    try:
+        # Настройка приватных прав
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False), # Скрываем от всех (@everyone)
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True) # Доступ боту
+        }
+        
+        # Ищем роль owner
+        owner_role = discord.utils.get(guild.roles, name="owner") or discord.utils.get(guild.roles, name="Owner")
+        if owner_role:
+            overwrites[owner_role] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
+
+        # Добавляем права владельцу сервера
+        if guild.owner:
+            overwrites[guild.owner] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
+
+        log_channel = await guild.create_text_channel(
+            name=LOG_CHANNEL_NAME,
+            overwrites=overwrites,
+            reason="Автоматический канал для логов ловушки"
+        )
+        print(f"Создан приватный логирующий канал: {log_channel.name}")
+        return log_channel
+    except Exception as e:
+        print(f"[ОШИБКА СОЗДАНИЯ ЛОГ-КАНАЛА] {e}")
+        return None
+
+
 @bot.event
 async def on_ready():
     print(f"Бот {bot.user} успешно запущен!")
@@ -214,6 +197,7 @@ async def on_ready():
             )
             await warning_msg.pin()
 
+
 @bot.event
 async def on_message(message):
     if message.author.bot or message.channel.id != TARGET_CHANNEL_ID:
@@ -224,9 +208,30 @@ async def on_message(message):
         return
 
     user = message.author
-    channel = message.channel
+    guild = message.guild
 
-    # 1. Отправляем уведомление в Telegram
+    # 1. Отправляем логи в приватный канал Discord (БЕЗ ТЕГОВ И ПИНГОВ)
+    try:
+        log_channel = await get_or_create_log_channel(guild)
+        if log_channel:
+            # Экранируем теги, чтобы никому не пришло уведомление
+            safe_content = message.content.replace("@everyone", "@‌everyone").replace("@here", "@‌here") if message.content else "_[без текста]_"
+            
+            embed = discord.Embed(
+                title="🚨 Нарушение в канале-ловушке!",
+                color=discord.Color.red(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.add_field(name="Пользователь", value=f"{user.mention} (`{user.id}`)", inline=True)
+            embed.add_field(name="Сообщение", value=safe_content, inline=False)
+            embed.set_footer(text="Автоматический лог системы безопасности")
+
+            # allowed_mentions=none полностью блокирует любые пинги от бота
+            await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f"[ОШИБКА ЛОГА В DISCORD] {e}")
+
+    # 2. Отправляем уведомление в Telegram
     try:
         send_telegram_notification(
             username=str(user),
@@ -237,31 +242,43 @@ async def on_message(message):
     except Exception as e:
         print(f"[ТЕЛЕГРАМ ОШИБКА] {e}")
 
-    # 2. Мгновенно удаляем сообщение из ловушки
+    # 3. Мгновенно удаляем сообщение из ловушки
     try:
         await message.delete()
         print(f"Удалено сообщение от {user} из ловушки.")
     except Exception as e:
         print(f"[ОШИБКА УДАЛЕНИЯ СООБЩЕНИЯ] {e}")
 
-    # 3. Выдаем таймаут на 12 часов
+    # 4. Выдаем таймаут на 12 часов
     try:
         await user.timeout(timedelta(hours=12), reason="Сообщение в заблокированном канале")
         print(f"Выдан таймаут пользователю {user}.")
     except Exception as e:
         print(f"[ОШИБКА ТАЙМАУТА] {e}")
 
-    # 4. Чистим сообщения пользователя за последние 5 минут в ловушке
+    # 5. Чистим сообщения за последние 5 минут ВО ВСЕХ КАНАЛАХ СЕРВЕРА
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
         return m.author.id == user.id and m.created_at >= five_minutes_ago
 
-    try:
-        deleted = await channel.purge(limit=100, check=is_user_recent_message)
-        print(f"Удалено {len(deleted)} старых сообщений пользователя {user} в ловушке.")
-    except Exception as e:
-        print(f"[ОШИБКА ЧИСТКИ] {e}")
+    # Объединяем абсолютна все каналы сервера
+    all_channels = (
+        guild.text_channels + 
+        guild.voice_channels + 
+        getattr(guild, 'stage_channels', []) + 
+        getattr(guild, 'forum_channels', [])
+    )
+
+    for ch in all_channels:
+        try:
+            permissions = ch.permissions_for(guild.me)
+            if permissions.manage_messages and permissions.read_message_history:
+                deleted = await ch.purge(limit=100, check=is_user_recent_message)
+                if deleted:
+                    print(f"Удалено {len(deleted)} сообщений у {user} в канале {ch.name}.")
+        except Exception as e:
+            print(f"[ОШИБКА ЧИСТКИ В КАНАЛЕ {ch.name}] {e}")
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(TOKEN)
