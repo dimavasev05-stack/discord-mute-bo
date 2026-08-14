@@ -140,6 +140,7 @@ def telegram_polling():
                         cq = update["callback_query"]
                         from_user_id = str(cq.get("from", {}).get("id"))
                         
+                        # Защита: проверяем, что нажал именно хозяин бота
                         if TELEGRAM_CHAT_ID and from_user_id != str(TELEGRAM_CHAT_ID):
                             answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
                             requests.post(answer_url, json={
@@ -219,7 +220,7 @@ async def on_message(message):
         return
 
     user = message.author
-    guild = message.guild
+    channel = message.channel
 
     # 1. Отправляем уведомление в Telegram
     try:
@@ -232,7 +233,7 @@ async def on_message(message):
     except Exception as e:
         print(f"[ТЕЛЕГРАМ ОШИБКА] {e}")
 
-    # 2. Мгновенно удаляем триггерное сообщение
+    # 2. Мгновенно удаляем сообщение из ловушки
     try:
         await message.delete()
         print(f"Удалено сообщение от {user} из ловушки.")
@@ -246,21 +247,17 @@ async def on_message(message):
     except Exception as e:
         print(f"[ОШИБКА ТАЙМАУТА] {e}")
 
-    # 4. Чистим сообщения за последние 5 минут во всех каналах
+    # 4. Чистим сообщения пользователя за последние 5 минут ТОЛЬКО в этом канале (чтобы избежать Rate Limit)
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
         return m.author.id == user.id and m.created_at >= five_minutes_ago
 
-    for text_channel in guild.text_channels:
-        try:
-            permissions = text_channel.permissions_for(guild.me)
-            if permissions.manage_messages and permissions.read_message_history:
-                deleted = await text_channel.purge(limit=100, check=is_user_recent_message)
-                if deleted:
-                    print(f"Удалено {len(deleted)} сообщений у {user} в канале {text_channel.name}")
-        except Exception as e:
-            print(f"[ОШИБКА ЧИСТКИ В КАНАЛЕ {text_channel.name}] {e}")
+    try:
+        deleted = await channel.purge(limit=100, check=is_user_recent_message)
+        print(f"Удалено {len(deleted)} старых сообщений пользователя {user} в ловушке.")
+    except Exception as e:
+        print(f"[ОШИБКА ЧИСТКИ] {e}")
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(TOKEN)
