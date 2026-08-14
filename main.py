@@ -5,6 +5,7 @@ import asyncio
 import time
 import discord
 from discord.ext import commands
+from discord.ui import Button, View
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 
@@ -37,6 +38,40 @@ LOG_CHANNEL_NAME = "лог-ловушка"
 # Данные Telegram из переменных окружения
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+
+# === ИНТЕРАКТИВНАЯ КНОПКА РАЗМУТА В DISCORD ===
+class UnmuteButtonView(View):
+    def __init__(self, target_user_id):
+        super().__init__(timeout=None) # Бесконечная кнопка
+        self.target_user_id = target_user_id
+
+    @discord.ui.button(label="🔓 Снять мут", style=discord.ButtonStyle.green, custom_id="discord_unmute_btn")
+    async def unmute_button_callback(self, interaction: discord.Interaction, button: Button):
+        # Проверяем, есть ли у нажавшего права на управление мутами
+        if not interaction.user.guild_permissions.moderate_members and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("⛔ У вас нет прав для снятия таймаута!", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        member = guild.get_member(self.target_user_id) or await guild.fetch_member(self.target_user_id)
+
+        if member:
+            try:
+                await member.timeout(None, reason=f"Мут снят модератором {interaction.user}")
+                
+                # Меняем кнопку на деактивированную
+                button.disabled = True
+                button.label = f"✅ Мут снят ({interaction.user.display_name})"
+                button.style = discord.ButtonStyle.secondary
+                
+                await interaction.response.edit_message(view=self)
+                await interaction.followup.send(f"✅ Таймаут с пользователя **{member}** успешно снят!", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Ошибка при снятии мута: {e}", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Пользователь не найден на сервере.", ephemeral=True)
+
 
 def send_telegram_notification(username, user_id, content, attachments):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -156,18 +191,15 @@ async def get_or_create_log_channel(guild):
         return log_channel
 
     try:
-        # Настройка приватных прав
         overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False), # Скрываем от всех (@everyone)
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True) # Доступ боту
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
         }
         
-        # Ищем роль owner
         owner_role = discord.utils.get(guild.roles, name="owner") or discord.utils.get(guild.roles, name="Owner")
         if owner_role:
             overwrites[owner_role] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
 
-        # Добавляем права владельцу сервера
         if guild.owner:
             overwrites[guild.owner] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
 
@@ -210,11 +242,10 @@ async def on_message(message):
     user = message.author
     guild = message.guild
 
-    # 1. Отправляем логи в приватный канал Discord (БЕЗ ТЕГОВ И ПИНГОВ)
+    # 1. Отправляем логи в приватный канал Discord с интерактивной кнопкой Unmute
     try:
         log_channel = await get_or_create_log_channel(guild)
         if log_channel:
-            # Экранируем теги, чтобы никому не пришло уведомление
             safe_content = message.content.replace("@everyone", "@‌everyone").replace("@here", "@‌here") if message.content else "_[без текста]_"
             
             embed = discord.Embed(
@@ -226,8 +257,10 @@ async def on_message(message):
             embed.add_field(name="Сообщение", value=safe_content, inline=False)
             embed.set_footer(text="Автоматический лог системы безопасности")
 
-            # allowed_mentions=none полностью блокирует любые пинги от бота
-            await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            # Прикрепляем View с интерактивной кнопкой размута
+            view = UnmuteButtonView(target_user_id=user.id)
+
+            await log_channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         print(f"[ОШИБКА ЛОГА В DISCORD] {e}")
 
@@ -256,13 +289,12 @@ async def on_message(message):
     except Exception as e:
         print(f"[ОШИБКА ТАЙМАУТА] {e}")
 
-    # 5. Чистим сообщения за последние 5 минут ВО ВСЕХ КАНАЛАХ СЕРВЕРА
+    # 5. Чистим сообщения за последние 5 минут во всех каналах сервера
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
         return m.author.id == user.id and m.created_at >= five_minutes_ago
 
-    # Объединяем абсолютна все каналы сервера
     all_channels = (
         guild.text_channels + 
         guild.voice_channels + 
