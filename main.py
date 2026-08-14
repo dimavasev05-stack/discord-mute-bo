@@ -46,7 +46,6 @@ def send_telegram_notification(username, user_id, content, attachments):
         f"💬 **Текст:** {content if content else '_[без текста]_'}"
     )
 
-    # Инлайн-кнопка для Telegram
     reply_markup = {
         "inline_keyboard": [
             [{"text": "🔓 Снять мут (Unmute)", "callback_data": f"unmute_{user_id}"}]
@@ -83,7 +82,6 @@ def send_telegram_notification(username, user_id, content, attachments):
                 
                 try:
                     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "media": media}, timeout=10)
-                    # Кнопку отправляем отдельным сообщением после альбома
                     url_msg = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
                     requests.post(url_msg, json={
                         "chat_id": TELEGRAM_CHAT_ID,
@@ -140,17 +138,26 @@ def telegram_polling():
                     
                     if "callback_query" in update:
                         cq = update["callback_query"]
+                        from_user_id = str(cq.get("from", {}).get("id"))
+                        
+                        if TELEGRAM_CHAT_ID and from_user_id != str(TELEGRAM_CHAT_ID):
+                            answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+                            requests.post(answer_url, json={
+                                "callback_query_id": cq.get("id"),
+                                "text": "⛔ У вас нет доступа к управлению этим ботом!",
+                                "show_alert": True
+                            })
+                            continue
+
                         data = cq.get("data", "")
                         callback_id = cq.get("id")
                         
                         if data.startswith("unmute_"):
                             user_id = int(data.split("_")[1])
                             
-                            # Передаем задачу на размут в основной поток Discord
                             future = asyncio.run_coroutine_threadsafe(unmute_discord_user(user_id), bot.loop)
                             success, user_name = future.result(timeout=10)
                             
-                            # Ответ всплывающим уведомлением в Telegram
                             answer_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
                             if success:
                                 msg_text = f"✅ Таймаут с пользователя {user_name} успешно снят!"
@@ -159,7 +166,6 @@ def telegram_polling():
                             
                             requests.post(answer_url, json={"callback_query_id": callback_id, "text": msg_text, "show_alert": True})
                             
-                            # Обновляем сообщение в Telegram, убирая кнопку
                             if success and "message" in cq:
                                 chat_id = cq["message"]["chat"]["id"]
                                 msg_id = cq["message"]["message_id"]
@@ -209,32 +215,38 @@ async def on_message(message):
         return
 
     if message.author.guild_permissions.administrator:
+        print(f"Сообщение от {message.author} проигнорировано (администратор).")
         return
 
     user = message.author
     guild = message.guild
 
-    # 1. Отправляем уведомление в Telegram перед удалением из Discord
-    send_telegram_notification(
-        username=str(user),
-        user_id=user.id,
-        content=message.content,
-        attachments=message.attachments
-    )
+    # 1. Отправляем уведомление в Telegram
+    try:
+        send_telegram_notification(
+            username=str(user),
+            user_id=user.id,
+            content=message.content,
+            attachments=message.attachments
+        )
+    except Exception as e:
+        print(f"[ТЕЛЕГРАМ ОШИБКА] {e}")
 
-    # 2. Мгновенно удаляем сообщение из канала-ловушки
+    # 2. Мгновенно удаляем триггерное сообщение
     try:
         await message.delete()
+        print(f"Удалено сообщение от {user} из ловушки.")
     except Exception as e:
-        print(f"Не удалось удалить сообщение: {e}")
+        print(f"[ОШИБКА УДАЛЕНИЯ СООБЩЕНИЯ] {e}")
 
     # 3. Выдаем таймаут на 12 часов
     try:
         await user.timeout(timedelta(hours=12), reason="Сообщение в заблокированном канале")
+        print(f"Выдан таймаут пользователю {user}.")
     except Exception as e:
-        print(f"Ошибка при выдаче таймаута: {e}")
+        print(f"[ОШИБКА ТАЙМАУТА] {e}")
 
-    # 4. Чистим сообщения нарушителя за последние 5 минут во всех каналах
+    # 4. Чистим сообщения за последние 5 минут во всех каналах
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
@@ -244,9 +256,11 @@ async def on_message(message):
         try:
             permissions = text_channel.permissions_for(guild.me)
             if permissions.manage_messages and permissions.read_message_history:
-                await text_channel.purge(limit=100, check=is_user_recent_message)
+                deleted = await text_channel.purge(limit=100, check=is_user_recent_message)
+                if deleted:
+                    print(f"Удалено {len(deleted)} сообщений у {user} в канале {text_channel.name}")
         except Exception as e:
-            print(f"Не удалось очистить канал {text_channel.name}: {e}")
+            print(f"[ОШИБКА ЧИСТКИ В КАНАЛЕ {text_channel.name}] {e}")
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(TOKEN)
