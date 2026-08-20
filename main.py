@@ -160,7 +160,7 @@ async def on_message(message):
     except Exception as e:
         print(f"[ОШИБКА ТАЙМАУТА] {e}")
 
-    # 4. Чистим сообщения за последние 5 минут абсолютно во всех каналах
+    # 4. Безопасная зачистка с паузой между каналами (защита от Rate Limit)
     five_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=5)
     
     def is_user_recent_message(m):
@@ -180,6 +180,9 @@ async def on_message(message):
                 deleted = await ch.purge(limit=100, check=is_user_recent_message)
                 if deleted:
                     print(f"Удалено {len(deleted)} сообщений у {user} в канале {ch.name}.")
+                
+                # Задержка 0.5 сек между каналами, чтобы Cloudflare и Discord не блокировали по Rate Limit
+                await asyncio.sleep(0.5)
         except Exception as e:
             print(f"[ОШИБКА ЧИСТКИ В КАНАЛЕ {ch.name}] {e}")
 
